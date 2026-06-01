@@ -664,7 +664,7 @@ MIT License
 
 ## Author
 
-- Research / Development: `Your Name`
+- Research / Development: `蘇家賢`
 - Institution: `National Taipei University of Technology`
 - Project: `General 3D Spatial Thermal Flow Simulator`
 
