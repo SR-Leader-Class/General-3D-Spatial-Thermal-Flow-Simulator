@@ -1,0 +1,672 @@
+#pragma kernel HeatStep
+#pragma kernel VelocityStep
+#pragma kernel ComputeDivergence
+#pragma kernel PressureJacobi
+#pragma kernel ProjectVelocity
+#pragma kernel ClearFloat3D
+#pragma kernel FillTemperature
+#pragma kernel FillVelocity
+#pragma kernel PaintSphereFloat
+#pragma kernel PaintSphereFloat4
+#pragma kernel PaintCellsFloat
+#pragma kernel PaintCellsFloat4
+#pragma kernel ReduceAbsMaxFloat3D
+#pragma kernel CopyTemperatureToBuffer
+
+Texture3D<float> _TemperatureTex;
+RWTexture3D<float> _TemperatureNextTex;
+
+Texture3D<float> _HeatSourceTex;
+Texture3D<float> _ObstacleTex;
+Texture3D<float4> _VelocityTex;
+RWTexture3D<float4> _VelocityNextTex;
+
+Texture3D<float> _DivergenceTex;
+Texture3D<float> _PressureTex;
+RWTexture3D<float> _PressureNextTex;
+
+RWTexture3D<float> _ResultFloatTex3D;
+RWTexture3D<float4> _ResultFloat4Tex3D;
+StructuredBuffer<int4> _PaintCells;
+RWStructuredBuffer<uint> _ReductionMaxBuffer;
+RWStructuredBuffer<float> _TemperatureReadbackBuffer;
+
+int _GridX;
+int _GridY;
+int _GridZ;
+
+float _DeltaTime;
+float _Diffusion;
+float _AmbientExchangeRate;
+float _AmbientTemperature;
+float _MinTemperatureClamp;
+float _MaxTemperatureClamp;
+float _MaxVelocityMagnitude;
+
+// 動量方程參數：
+// du/dt + (u·∇)u = nu*Laplacian(u) + buoyancy - damping*u
+// 對應：
+// - nu: 黏滯係數（_VelocityViscosity）
+// - buoyancy: 浮力項（由溫度相對環境溫度差產生）
+// - damping: 數值阻尼，抑制高速震盪
+float _VelocityViscosity;
+float _VelocityDamping;
+float _BuoyancyStrength;
+float _Gravity;
+
+// 壓力求解（Poisson）
+float _PressureRelaxation;
+
+float4 _InvCellSize; // xyz = 1 / cell size（1/dx, 1/dy, 1/dz）
+
+float _ClearValue;
+float _FillValue;
+float4 _FillVelocity;
+
+int _PaintMode; // 0 = Set（覆寫）, 1 = Add（累加）
+int _PaintUseSoftFalloff; // 1 = 熱源/冷源/速度場柔和權重, 0 = 障礙物硬邊界
+float4 _PaintCenterWorldRadius; // xyz = 世界座標中心, w = 世界半徑
+float _PaintScalar;
+float4 _PaintVector;
+float4 _SimulationBoundsMin;
+float4 _SimulationBoundsMax;
+int _PaintCellCount;
+
+int3 ClampToGrid(int3 p)
+{
+    return int3(
+        clamp(p.x, 0, _GridX - 1),
+        clamp(p.y, 0, _GridY - 1),
+        clamp(p.z, 0, _GridZ - 1)
+    );
+}
+
+bool IsOutsideGrid(int3 p)
+{
+    return p.x < 0 || p.x >= _GridX ||
+           p.y < 0 || p.y >= _GridY ||
+           p.z < 0 || p.z >= _GridZ;
+}
+
+bool IsSolidCell(int3 p)
+{
+    return IsOutsideGrid(p) || _ObstacleTex[ClampToGrid(p)] > 0.5f;
+}
+
+bool IsCellObstacle(int3 p)
+{
+    // 障礙物場 > 0.5 視為固體。
+    return _ObstacleTex[ClampToGrid(p)] > 0.5f;
+}
+
+float ReadTemperatureSafe(int3 p)
+{
+    return _TemperatureTex[ClampToGrid(p)];
+}
+
+float3 ReadVelocitySafe(int3 p)
+{
+    return _VelocityTex[ClampToGrid(p)].xyz;
+}
+
+float ReadPressureSafe(int3 p)
+{
+    return _PressureTex[ClampToGrid(p)];
+}
+
+float NeighborTemperatureOrCenter(int3 neighbor, float center)
+{
+    return IsSolidCell(neighbor) ? center : _TemperatureTex[ClampToGrid(neighbor)];
+}
+
+float3 NeighborVelocityOrCenter(int3 neighbor, float3 center)
+{
+    // obstacle 鄰居視為靜止壁面（簡化 no-slip）。
+    return IsSolidCell(neighbor) ? float3(0.0, 0.0, 0.0) : _VelocityTex[ClampToGrid(neighbor)].xyz;
+}
+
+float NeighborPressureOrCenter(int3 neighbor, float center)
+{
+    return IsSolidCell(neighbor) ? center : _PressureTex[ClampToGrid(neighbor)];
+}
+
+int3 PosToGrid(float3 pos)
+{
+    return ClampToGrid(int3(floor(pos + 0.5)));
+}
+
+bool TraceHitsObstacle(float3 startPos, float3 endPos)
+{
+    float3 delta = endPos - startPos;
+    float maxAxisTravel = max(abs(delta.x), max(abs(delta.y), abs(delta.z)));
+    int steps = max(1, (int)ceil(maxAxisTravel * 2.0));
+
+    for (int i = 1; i <= steps; i++)
+    {
+        float t = (float)i / (float)steps;
+        if (IsCellObstacle(PosToGrid(lerp(startPos, endPos, t))))
+            return true;
+    }
+
+    return false;
+}
+
+float SampleTemperatureAdvection(int3 p, float3 vel, float center)
+{
+    // 半拉格朗日（Semi-Lagrangian）回溯取樣：沿速度反向找前一時間位置。
+    if (dot(vel, vel) < 1e-10f)
+        return center;
+
+    float3 voxelOffset = vel * _DeltaTime * _InvCellSize.xyz;
+    float3 prevPos = (float3)p - voxelOffset;
+    prevPos = clamp(prevPos, 0.0, float3(_GridX - 1, _GridY - 1, _GridZ - 1));
+
+    if (TraceHitsObstacle((float3)p, prevPos) || IsCellObstacle(PosToGrid(prevPos)))
+        return center;
+
+    int3 p0 = int3(floor(prevPos));
+    int3 p1 = ClampToGrid(p0 + int3(1, 1, 1));
+    float3 f = frac(prevPos);
+
+    int3 c000 = int3(p0.x, p0.y, p0.z);
+    int3 c100 = int3(p1.x, p0.y, p0.z);
+    int3 c010 = int3(p0.x, p1.y, p0.z);
+    int3 c110 = int3(p1.x, p1.y, p0.z);
+    int3 c001 = int3(p0.x, p0.y, p1.z);
+    int3 c101 = int3(p1.x, p0.y, p1.z);
+    int3 c011 = int3(p0.x, p1.y, p1.z);
+    int3 c111 = int3(p1.x, p1.y, p1.z);
+
+    float t000 = IsCellObstacle(c000) ? center : ReadTemperatureSafe(c000);
+    float t100 = IsCellObstacle(c100) ? center : ReadTemperatureSafe(c100);
+    float t010 = IsCellObstacle(c010) ? center : ReadTemperatureSafe(c010);
+    float t110 = IsCellObstacle(c110) ? center : ReadTemperatureSafe(c110);
+    float t001 = IsCellObstacle(c001) ? center : ReadTemperatureSafe(c001);
+    float t101 = IsCellObstacle(c101) ? center : ReadTemperatureSafe(c101);
+    float t011 = IsCellObstacle(c011) ? center : ReadTemperatureSafe(c011);
+    float t111 = IsCellObstacle(c111) ? center : ReadTemperatureSafe(c111);
+
+    float t00 = lerp(t000, t100, f.x);
+    float t10 = lerp(t010, t110, f.x);
+    float t01 = lerp(t001, t101, f.x);
+    float t11 = lerp(t011, t111, f.x);
+    float t0 = lerp(t00, t10, f.y);
+    float t1 = lerp(t01, t11, f.y);
+    return lerp(t0, t1, f.z);
+}
+
+float3 SampleVelocityAdvection(int3 p, float3 vel, float3 center)
+{
+    // 速度場同樣採用半拉格朗日回溯，提升穩定性。
+    if (dot(vel, vel) < 1e-10f)
+        return center;
+
+    float3 voxelOffset = vel * _DeltaTime * _InvCellSize.xyz;
+    float3 prevPos = (float3)p - voxelOffset;
+    prevPos = clamp(prevPos, 0.0, float3(_GridX - 1, _GridY - 1, _GridZ - 1));
+
+    if (TraceHitsObstacle((float3)p, prevPos) || IsCellObstacle(PosToGrid(prevPos)))
+        return center;
+
+    int3 p0 = int3(floor(prevPos));
+    int3 p1 = ClampToGrid(p0 + int3(1, 1, 1));
+    float3 f = frac(prevPos);
+
+    int3 c000 = int3(p0.x, p0.y, p0.z);
+    int3 c100 = int3(p1.x, p0.y, p0.z);
+    int3 c010 = int3(p0.x, p1.y, p0.z);
+    int3 c110 = int3(p1.x, p1.y, p0.z);
+    int3 c001 = int3(p0.x, p0.y, p1.z);
+    int3 c101 = int3(p1.x, p0.y, p1.z);
+    int3 c011 = int3(p0.x, p1.y, p1.z);
+    int3 c111 = int3(p1.x, p1.y, p1.z);
+
+    float3 v000 = IsCellObstacle(c000) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c000);
+    float3 v100 = IsCellObstacle(c100) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c100);
+    float3 v010 = IsCellObstacle(c010) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c010);
+    float3 v110 = IsCellObstacle(c110) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c110);
+    float3 v001 = IsCellObstacle(c001) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c001);
+    float3 v101 = IsCellObstacle(c101) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c101);
+    float3 v011 = IsCellObstacle(c011) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c011);
+    float3 v111 = IsCellObstacle(c111) ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(c111);
+
+    float3 v00 = lerp(v000, v100, f.x);
+    float3 v10 = lerp(v010, v110, f.x);
+    float3 v01 = lerp(v001, v101, f.x);
+    float3 v11 = lerp(v011, v111, f.x);
+    float3 v0 = lerp(v00, v10, f.y);
+    float3 v1 = lerp(v01, v11, f.y);
+    return lerp(v0, v1, f.z);
+}
+
+bool IsInsidePaintSphereHard(int3 p)
+{
+    // 障礙物使用硬邊界：球體 vs 體素 AABB 相交測試（0/1）。
+    float3 simMin = _SimulationBoundsMin.xyz;
+    float3 simMax = _SimulationBoundsMax.xyz;
+    float3 simSize = max(simMax - simMin, float3(1e-6, 1e-6, 1e-6));
+    float3 cellSize = simSize / max(float3(_GridX, _GridY, _GridZ), float3(1.0, 1.0, 1.0));
+
+    // 體素在世界座標下的 AABB。
+    float3 voxelMin = simMin + cellSize * (float3)p;
+    float3 voxelMax = voxelMin + cellSize;
+
+    float3 sphereCenter = _PaintCenterWorldRadius.xyz;
+    float radius = abs(_PaintCenterWorldRadius.w);
+
+    // Sphere-AABB 最近點測試：
+    // 取球心到 AABB 最近點，若距離 <= 半徑，則相交。
+    float3 closest = clamp(sphereCenter, voxelMin, voxelMax);
+    float3 delta = sphereCenter - closest;
+    return dot(delta, delta) <= (radius * radius);
+}
+
+float GetPaintSphereWeight(int3 p)
+{
+    // 柔和權重：以體素中心到球心距離計算 Gaussian + 邊界 smoothstep 衰減。
+    float3 simMin = _SimulationBoundsMin.xyz;
+    float3 simMax = _SimulationBoundsMax.xyz;
+    float3 simSize = max(simMax - simMin, float3(1e-6, 1e-6, 1e-6));
+    float3 cellSize = simSize / max(float3(_GridX, _GridY, _GridZ), float3(1.0, 1.0, 1.0));
+
+    float3 voxelCenter = simMin + cellSize * ((float3)p + 0.5);
+    float3 sourceCenter = _PaintCenterWorldRadius.xyz;
+    float radius = max(abs(_PaintCenterWorldRadius.w), 1e-6);
+
+    float3 d = voxelCenter - sourceCenter;
+    float distanceToCenter = length(d);
+    if (distanceToCenter >= radius)
+        return 0.0;
+
+    float sigma = max(radius * 0.45, 1e-6);
+    float sigma2 = sigma * sigma;
+    float gaussian = exp(-0.5 * (distanceToCenter * distanceToCenter) / sigma2);
+    float edgeFade = 1.0 - smoothstep(radius * 0.75, radius, distanceToCenter);
+    return saturate(gaussian * edgeFade);
+}
+
+[numthreads(4,4,4)]
+void HeatStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    int3 p = int3(id.xyz);
+
+    if (IsCellObstacle(p))
+    {
+        _TemperatureNextTex[p] = _TemperatureTex[p];
+        return;
+    }
+
+    float center = _TemperatureTex[p];
+
+    float left = NeighborTemperatureOrCenter(p + int3(-1, 0, 0), center);
+    float right = NeighborTemperatureOrCenter(p + int3(1, 0, 0), center);
+    float down = NeighborTemperatureOrCenter(p + int3(0, -1, 0), center);
+    float up = NeighborTemperatureOrCenter(p + int3(0, 1, 0), center);
+    float back = NeighborTemperatureOrCenter(p + int3(0, 0, -1), center);
+    float front = NeighborTemperatureOrCenter(p + int3(0, 0, 1), center);
+
+    // 含尺度的離散 Laplacian（考慮 dx, dy, dz）。
+    float invDx2 = _InvCellSize.x * _InvCellSize.x;
+    float invDy2 = _InvCellSize.y * _InvCellSize.y;
+    float invDz2 = _InvCellSize.z * _InvCellSize.z;
+    float laplacian =
+        (left - 2.0f * center + right) * invDx2 +
+        (down - 2.0f * center + up) * invDy2 +
+        (back - 2.0f * center + front) * invDz2;
+    float3 vel = _VelocityTex[p].xyz;
+    float advectedTemp = SampleTemperatureAdvection(p, vel, center);
+
+    // 以 operator splitting 近似：
+    // 1) 先半拉格朗日平流
+    // 2) 再加入擴散、熱源與環境交換
+    float result = advectedTemp + _Diffusion * _DeltaTime * laplacian;
+    result += _HeatSourceTex[p] * _DeltaTime;
+    float ambientBlend = 1.0 - exp(-_AmbientExchangeRate * _DeltaTime);
+    result = lerp(result, _AmbientTemperature, saturate(ambientBlend));
+    result = clamp(result, _MinTemperatureClamp, _MaxTemperatureClamp);
+
+    _TemperatureNextTex[p] = result;
+}
+
+[numthreads(4,4,4)]
+void VelocityStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    int3 p = int3(id.xyz);
+
+    if (IsCellObstacle(p))
+    {
+        _VelocityNextTex[p] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    // 動量更新：
+    // v_next = advect(v) + dt*(nu*Laplacian(v)+buoyancy) - damping
+    float3 center = _VelocityTex[p].xyz;
+    float3 advectedVel = SampleVelocityAdvection(p, center, center);
+
+    float3 left = NeighborVelocityOrCenter(p + int3(-1, 0, 0), center);
+    float3 right = NeighborVelocityOrCenter(p + int3(1, 0, 0), center);
+    float3 down = NeighborVelocityOrCenter(p + int3(0, -1, 0), center);
+    float3 up = NeighborVelocityOrCenter(p + int3(0, 1, 0), center);
+    float3 back = NeighborVelocityOrCenter(p + int3(0, 0, -1), center);
+    float3 front = NeighborVelocityOrCenter(p + int3(0, 0, 1), center);
+
+    float invDx2 = _InvCellSize.x * _InvCellSize.x;
+    float invDy2 = _InvCellSize.y * _InvCellSize.y;
+    float invDz2 = _InvCellSize.z * _InvCellSize.z;
+    float3 laplacianVel =
+        (left - 2.0f * center + right) * invDx2 +
+        (down - 2.0f * center + up) * invDy2 +
+        (back - 2.0f * center + front) * invDz2;
+    float3 viscous = _VelocityViscosity * laplacianVel;
+
+    // 這裡要觀察到「熱往上走」主要靠浮力對流，不是傳導本身。
+    // 為了讓即時模擬在低解析度下仍可觀察，將 _BuoyancyStrength 視為
+    // 每 1 C 溫差對應的有效浮力比例，再乘上重力得到向上加速度。
+    float buoyancy = _Gravity * _BuoyancyStrength * (_TemperatureTex[p] - _AmbientTemperature);
+    float3 buoyancyForce = float3(0.0, buoyancy, 0.0);
+
+    float3 nextVel = advectedVel + (viscous + buoyancyForce) * _DeltaTime;
+    nextVel *= max(0.0, 1.0 - _VelocityDamping * _DeltaTime);
+    float speed = length(nextVel);
+    if (speed > _MaxVelocityMagnitude)
+        nextVel *= _MaxVelocityMagnitude / max(speed, 1e-6f);
+
+    _VelocityNextTex[p] = float4(nextVel, 0.0);
+}
+
+[numthreads(4,4,4)]
+void ComputeDivergence(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    int3 p = int3(id.xyz);
+    if (IsCellObstacle(p))
+    {
+        _ResultFloatTex3D[p] = 0.0;
+        return;
+    }
+
+    float3 center = _VelocityTex[p].xyz;
+    bool solidLeft = IsSolidCell(p + int3(-1, 0, 0));
+    bool solidRight = IsSolidCell(p + int3(1, 0, 0));
+    bool solidDown = IsSolidCell(p + int3(0, -1, 0));
+    bool solidUp = IsSolidCell(p + int3(0, 1, 0));
+    bool solidBack = IsSolidCell(p + int3(0, 0, -1));
+    bool solidFront = IsSolidCell(p + int3(0, 0, 1));
+
+    float3 left = solidLeft ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(p + int3(-1, 0, 0));
+    float3 right = solidRight ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(p + int3(1, 0, 0));
+    float3 down = solidDown ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(p + int3(0, -1, 0));
+    float3 up = solidUp ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(p + int3(0, 1, 0));
+    float3 back = solidBack ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(p + int3(0, 0, -1));
+    float3 front = solidFront ? float3(0.0, 0.0, 0.0) : ReadVelocitySafe(p + int3(0, 0, 1));
+
+    float leftFace = solidLeft ? 0.0 : 0.5 * (center.x + left.x);
+    float rightFace = solidRight ? 0.0 : 0.5 * (center.x + right.x);
+    float downFace = solidDown ? 0.0 : 0.5 * (center.y + down.y);
+    float upFace = solidUp ? 0.0 : 0.5 * (center.y + up.y);
+    float backFace = solidBack ? 0.0 : 0.5 * (center.z + back.z);
+    float frontFace = solidFront ? 0.0 : 0.5 * (center.z + front.z);
+
+    // 中心差分估計散度 div(v)。
+    float div =
+        (rightFace - leftFace) * _InvCellSize.x +
+        (upFace - downFace) * _InvCellSize.y +
+        (frontFace - backFace) * _InvCellSize.z;
+
+    _ResultFloatTex3D[p] = div;
+}
+
+[numthreads(4,4,4)]
+void PressureJacobi(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    int3 p = int3(id.xyz);
+    if (IsCellObstacle(p))
+    {
+        _PressureNextTex[p] = 0.0;
+        return;
+    }
+
+    float center = _PressureTex[p];
+    bool solidLeft = IsSolidCell(p + int3(-1, 0, 0));
+    bool solidRight = IsSolidCell(p + int3(1, 0, 0));
+    bool solidDown = IsSolidCell(p + int3(0, -1, 0));
+    bool solidUp = IsSolidCell(p + int3(0, 1, 0));
+    bool solidBack = IsSolidCell(p + int3(0, 0, -1));
+    bool solidFront = IsSolidCell(p + int3(0, 0, 1));
+
+    float pL = solidLeft ? center : ReadPressureSafe(p + int3(-1, 0, 0));
+    float pR = solidRight ? center : ReadPressureSafe(p + int3(1, 0, 0));
+    float pD = solidDown ? center : ReadPressureSafe(p + int3(0, -1, 0));
+    float pU = solidUp ? center : ReadPressureSafe(p + int3(0, 1, 0));
+    float pB = solidBack ? center : ReadPressureSafe(p + int3(0, 0, -1));
+    float pF = solidFront ? center : ReadPressureSafe(p + int3(0, 0, 1));
+
+    // 離散 Poisson：
+    // Laplacian(p) = div(v)
+    // 以 Jacobi 迭代近似解壓力場。
+    float invDx2 = _InvCellSize.x * _InvCellSize.x;
+    float invDy2 = _InvCellSize.y * _InvCellSize.y;
+    float invDz2 = _InvCellSize.z * _InvCellSize.z;
+    float weightedNeighborSum = 0.0;
+    float denom = 0.0;
+
+    if (!solidLeft)
+    {
+        weightedNeighborSum += pL * invDx2;
+        denom += invDx2;
+    }
+    if (!solidRight)
+    {
+        weightedNeighborSum += pR * invDx2;
+        denom += invDx2;
+    }
+    if (!solidDown)
+    {
+        weightedNeighborSum += pD * invDy2;
+        denom += invDy2;
+    }
+    if (!solidUp)
+    {
+        weightedNeighborSum += pU * invDy2;
+        denom += invDy2;
+    }
+    if (!solidBack)
+    {
+        weightedNeighborSum += pB * invDz2;
+        denom += invDz2;
+    }
+    if (!solidFront)
+    {
+        weightedNeighborSum += pF * invDz2;
+        denom += invDz2;
+    }
+
+    float div = _DivergenceTex[p];
+    float pNew = (weightedNeighborSum - div) / max(denom, 1e-6);
+
+    // relaxation=1 為標準 Jacobi；>1 偏向 over-relaxation，可加速但可能不穩。
+    _PressureNextTex[p] = lerp(center, pNew, _PressureRelaxation);
+}
+
+[numthreads(4,4,4)]
+void ProjectVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    int3 p = int3(id.xyz);
+    if (IsCellObstacle(p))
+    {
+        _VelocityNextTex[p] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    float center = _PressureTex[p];
+    float pL = NeighborPressureOrCenter(p + int3(-1, 0, 0), center);
+    float pR = NeighborPressureOrCenter(p + int3(1, 0, 0), center);
+    float pD = NeighborPressureOrCenter(p + int3(0, -1, 0), center);
+    float pU = NeighborPressureOrCenter(p + int3(0, 1, 0), center);
+    float pB = NeighborPressureOrCenter(p + int3(0, 0, -1), center);
+    float pF = NeighborPressureOrCenter(p + int3(0, 0, 1), center);
+
+    // 壓力投影：
+    // v_projected = v - grad(p)
+    // 目標是讓新速度場接近不可壓縮（散度接近 0）。
+    float3 gradP = float3(
+        (pR - pL) * 0.5 * _InvCellSize.x,
+        (pU - pD) * 0.5 * _InvCellSize.y,
+        (pF - pB) * 0.5 * _InvCellSize.z);
+
+    float3 v = _VelocityTex[p].xyz;
+    float3 vProjected = v - gradP;
+
+    if (IsSolidCell(p + int3(-1, 0, 0)) && vProjected.x < 0.0)
+        vProjected.x = 0.0;
+    if (IsSolidCell(p + int3(1, 0, 0)) && vProjected.x > 0.0)
+        vProjected.x = 0.0;
+    if (IsSolidCell(p + int3(0, -1, 0)) && vProjected.y < 0.0)
+        vProjected.y = 0.0;
+    if (IsSolidCell(p + int3(0, 1, 0)) && vProjected.y > 0.0)
+        vProjected.y = 0.0;
+    if (IsSolidCell(p + int3(0, 0, -1)) && vProjected.z < 0.0)
+        vProjected.z = 0.0;
+    if (IsSolidCell(p + int3(0, 0, 1)) && vProjected.z > 0.0)
+        vProjected.z = 0.0;
+
+    _VelocityNextTex[p] = float4(vProjected, 0.0);
+}
+
+[numthreads(4,4,4)]
+void ClearFloat3D(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    _ResultFloatTex3D[int3(id.xyz)] = _ClearValue;
+}
+
+[numthreads(4,4,4)]
+void FillTemperature(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    _ResultFloatTex3D[int3(id.xyz)] = _FillValue;
+}
+
+[numthreads(4,4,4)]
+void FillVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    _ResultFloat4Tex3D[int3(id.xyz)] = _FillVelocity;
+}
+
+[numthreads(4,4,4)]
+void PaintSphereFloat(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    int3 p = int3(id.xyz);
+    float weight = (_PaintUseSoftFalloff != 0)
+        ? GetPaintSphereWeight(p)
+        : (IsInsidePaintSphereHard(p) ? 1.0 : 0.0);
+
+    if (weight <= 0.0001)
+        return;
+
+    float current = _ResultFloatTex3D[p];
+    if (_PaintMode == 0)
+        _ResultFloatTex3D[p] = lerp(current, _PaintScalar, weight);
+    else
+        _ResultFloatTex3D[p] = current + _PaintScalar * weight;
+}
+
+[numthreads(4,4,4)]
+void PaintSphereFloat4(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    int3 p = int3(id.xyz);
+    float weight = (_PaintUseSoftFalloff != 0)
+        ? GetPaintSphereWeight(p)
+        : (IsInsidePaintSphereHard(p) ? 1.0 : 0.0);
+
+    if (weight <= 0.0001)
+        return;
+
+    float4 current = _ResultFloat4Tex3D[p];
+    if (_PaintMode == 0)
+        _ResultFloat4Tex3D[p] = lerp(current, _PaintVector, weight);
+    else
+        _ResultFloat4Tex3D[p] = current + _PaintVector * weight;
+}
+
+[numthreads(64,1,1)]
+void PaintCellsFloat(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_PaintCellCount)
+        return;
+
+    int3 p = ClampToGrid(_PaintCells[id.x].xyz);
+    float current = _ResultFloatTex3D[p];
+    if (_PaintMode == 0)
+        _ResultFloatTex3D[p] = _PaintScalar;
+    else
+        _ResultFloatTex3D[p] = current + _PaintScalar;
+}
+
+[numthreads(64,1,1)]
+void PaintCellsFloat4(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_PaintCellCount)
+        return;
+
+    int3 p = ClampToGrid(_PaintCells[id.x].xyz);
+    float4 current = _ResultFloat4Tex3D[p];
+    if (_PaintMode == 0)
+        _ResultFloat4Tex3D[p] = _PaintVector;
+    else
+        _ResultFloat4Tex3D[p] = current + _PaintVector;
+}
+
+[numthreads(4,4,4)]
+void ReduceAbsMaxFloat3D(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridX || id.y >= (uint)_GridY || id.z >= (uint)_GridZ)
+        return;
+
+    float value = abs(_DivergenceTex[int3(id.xyz)]);
+    InterlockedMax(_ReductionMaxBuffer[0], asuint(value));
+}
+
+[numthreads(64, 1, 1)]
+void CopyTemperatureToBuffer(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    uint total = (uint)(_GridX * _GridY * _GridZ);
+
+    if (index >= total)
+        return;
+
+    uint x = index % (uint)_GridX;
+    uint y = (index / (uint)_GridX) % (uint)_GridY;
+    uint z = index / ((uint)_GridX * (uint)_GridY);
+
+    _TemperatureReadbackBuffer[index] = _TemperatureTex[int3(x, y, z)];
+}
