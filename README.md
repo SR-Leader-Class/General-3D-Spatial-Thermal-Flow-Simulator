@@ -650,17 +650,6 @@ It should not be used as a replacement for validated engineering CFD software wh
 
 ---
 
-## License
-
-Add your preferred license here.
-
-Example:
-
-```text
-MIT License
-```
-
----
 
 ## Author
 
