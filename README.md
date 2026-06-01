@@ -21,7 +21,7 @@
 
 ## Preview
 
-> 可在此放入專案截圖或 GIF。
+> 專案截圖。
 
 ```md
 ![Thermal Slice Preview](Docs/Images/thermal_slice_preview.png)
