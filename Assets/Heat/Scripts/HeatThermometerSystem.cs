@@ -1,3 +1,11 @@
+/*
+ * Created :    Summer 2026
+ * Author :     蘇家賢
+ * Project :    General-3D-Spatial-Thermal-Flow-Simulator
+ * Filename :   HeatThermometerSystem.cs
+ * 
+ */
+
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
