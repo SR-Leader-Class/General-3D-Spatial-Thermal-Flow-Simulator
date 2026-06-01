@@ -1,3 +1,11 @@
+/*
+ * Created :    Summer 2026
+ * Author :     蘇家賢
+ * Project :    General-3D-Spatial-Thermal-Flow-Simulator
+ * Filename :   HeatSlicePlaneController.cs
+ * 
+ */
+
 using System;
 using System.IO;
 using UnityEngine;
