@@ -24,8 +24,7 @@
 > 專案截圖。
 
 ```md
-![Thermal Slice Preview](Docs/Images/thermal_slice_preview.png)
-![Wind Field Preview](Docs/Images/wind_field_preview.png)
+![Thermal Slice Preview](Docs/Images/Preview_1.png)
 ```
 
 ---
