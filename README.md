@@ -24,7 +24,7 @@
 > 專案截圖。
 
 ```md
-![Thermal Slice Preview](Docs/Images/Preview_1.png)
+![Thermal Slice Preview](Images/Preview_1.png)
 ```
 
 ---
