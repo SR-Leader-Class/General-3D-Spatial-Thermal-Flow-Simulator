@@ -353,7 +353,7 @@ $$
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/your-username/General-3D-Spatial-Thermal-Flow-Simulator.git
+git clone https://github.com/SR-Leader-Class/General-3D-Spatial-Thermal-Flow-Simulator.git
 ```
 
 2. Open the project with Unity.
