@@ -594,8 +594,7 @@ General-3D-Spatial-Thermal-Flow-Simulator/
 │   ├── Scenes/
 │   └── Prefabs/
 ├── Docs/
-│   ├── Images/
-│   └── Paper/
+│   └── Images/
 ├── README.md
 └── LICENSE
 ```
@@ -624,8 +623,6 @@ The theoretical and implementation background of this project is related to:
 - Unity Compute Shader and 3D RenderTexture
 - AsyncGPUReadback-based GPU data readback
 - Building thermal environment and CFD validation concepts
-
-For full academic references, please see the accompanying paper in the `Docs/Paper/` folder.
 
 ---
 
