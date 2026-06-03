@@ -427,13 +427,8 @@ Use a test driver or custom script to add sources.
 
 Example concepts:
 
-```csharp
-// Add a 200W heat source
-simulation.AddPowerHeatSource(worldPosition, radius, 200f);
-
-// Add a -500W cooling source
-simulation.AddPowerHeatSource(worldPosition, radius, -500f);
-```
+![Thermal Slice Preview](Images/Heat Sources.png)
+![Thermal Slice Preview](Images/Cold Sources.png)
 
 > Actual method names may vary according to the implementation version.
 
@@ -443,10 +438,7 @@ simulation.AddPowerHeatSource(worldPosition, radius, -500f);
 
 Use a velocity injection area to simulate supply air or return air:
 
-```csharp
-// Set local airflow direction and speed
-simulation.SetVelocity(worldPosition, radius, new Vector3(1f, 0f, 0f));
-```
+![Thermal Slice Preview](Images/Local Velocities.png)
 
 ---
 
@@ -454,9 +446,7 @@ simulation.SetVelocity(worldPosition, radius, new Vector3(1f, 0f, 0f));
 
 Use box, sphere, or Collider voxelization to mark solid regions:
 
-```csharp
-simulation.PaintObstacleFromCollider(targetCollider);
-```
+![Thermal Slice Preview](Images/Obstacles.png)
 
 Obstacle voxels block heat and velocity updates in the simplified solid-wall model.
 
