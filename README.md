@@ -427,8 +427,8 @@ Use a test driver or custom script to add sources.
 
 Example concepts:
 
-![Thermal Slice Preview](Images/Heat Sources.png)
-![Thermal Slice Preview](Images/Cold Sources.png)
+![Thermal Slice Preview](Images/Heat-Sources.png)
+![Thermal Slice Preview](Images/Cold-Sources.png)
 
 > Actual method names may vary according to the implementation version.
 
@@ -438,7 +438,7 @@ Example concepts:
 
 Use a velocity injection area to simulate supply air or return air:
 
-![Thermal Slice Preview](Images/Local Velocities.png)
+![Thermal Slice Preview](Images/Local-Velocities.png)
 
 ---
 
