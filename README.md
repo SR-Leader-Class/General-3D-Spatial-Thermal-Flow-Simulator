@@ -24,7 +24,7 @@
 > 專案截圖。
 
 ![Thermal Slice Preview](Images/Preview_1.png)
-![Thermal Slice Preview](https://youtu.be/k-5ruIngDR4)
+[![Unity熱流模擬軟體第一版](https://youtube.com)](https://youtu.be/k-5ruIngDR4)
 
 ---
 
